@@ -1,0 +1,310 @@
+From a3010bbbb4c5591e788730cf8d31ec8a11bf4773 Mon Sep 17 00:00:00 2001
+From: Unprex <bbrouant@sfr.fr>
+Date: Mon, 24 Oct 2022 23:47:57 +0200
+Subject: [PATCH 1/2] Add screen auto rotation support
+
+---
+ Makefile     |   2 +-
+ config.def.h |  17 +++++
+ dwl.c        | 173 +++++++++++++++++++++++++++++++++++++++++++++++++++
+ 3 files changed, 191 insertions(+), 1 deletion(-)
+
+diff --git a/Makefile b/Makefile
+index ccca07948..d35d34aac 100644
+--- a/Makefile
++++ b/Makefile
+@@ -9,7 +9,7 @@ DWLDEVCFLAGS = -pedantic -Wall -Wextra -Wdeclaration-after-statement -Wno-unused
+ 	-Werror=strict-prototypes -Werror=implicit -Werror=return-type -Werror=incompatible-pointer-types
+ 
+ # CFLAGS / LDFLAGS
+-PKGS      = wlroots wayland-server xkbcommon libinput $(XLIBS)
++PKGS      = wlroots wayland-server xkbcommon libinput libudev $(XLIBS)
+ DWLCFLAGS = `$(PKG_CONFIG) --cflags $(PKGS)` $(DWLCPPFLAGS) $(DWLDEVCFLAGS) $(CFLAGS)
+ LDLIBS    = `$(PKG_CONFIG) --libs $(PKGS)` $(LIBS)
+ 
+diff --git a/config.def.h b/config.def.h
+index ec1f05289..7cf48b065 100644
+--- a/config.def.h
++++ b/config.def.h
+@@ -37,6 +37,18 @@ static const MonitorRule monrules[] = {
+ 	{ NULL,       0.55, 1,      1,    &layouts[0], WL_OUTPUT_TRANSFORM_NORMAL },
+ };
+ 
++/* auto rotation */
++static bool rotation_enabled = true;
++static const int rotation_delay = 500;
++static const float rotation_flat = 0.9;
++static const float rotation_thresh = 0.6;
++
++/* accelerometer used */
++static const char *accel_path = "/dev/input/accel";
++static const char *accel_x = "in_accel_x_raw";
++static const char *accel_y = "in_accel_y_raw";
++static const char *accel_z = "in_accel_z_raw";
++
+ /* keyboard */
+ static const struct xkb_rule_names xkb_rules = {
+ 	/* can specify fields: rules, model, layout, variant, options */
+@@ -127,6 +139,11 @@ static const Key keys[] = {
+ 	{ MODKEY,                    XKB_KEY_period,     focusmon,       {.i = WLR_DIRECTION_RIGHT} },
+ 	{ MODKEY|WLR_MODIFIER_SHIFT, XKB_KEY_less,       tagmon,         {.i = WLR_DIRECTION_LEFT} },
+ 	{ MODKEY|WLR_MODIFIER_SHIFT, XKB_KEY_greater,    tagmon,         {.i = WLR_DIRECTION_RIGHT} },
++	{ MODKEY|WLR_MODIFIER_SHIFT, XKB_KEY_Up,         setrotation,    {.i = WL_OUTPUT_TRANSFORM_NORMAL} },
++	{ MODKEY|WLR_MODIFIER_SHIFT, XKB_KEY_Left,       setrotation,    {.i = WL_OUTPUT_TRANSFORM_90} },
++	{ MODKEY|WLR_MODIFIER_SHIFT, XKB_KEY_Down,       setrotation,    {.i = WL_OUTPUT_TRANSFORM_180} },
++	{ MODKEY|WLR_MODIFIER_SHIFT, XKB_KEY_Right,      setrotation,    {.i = WL_OUTPUT_TRANSFORM_270} },
++	{ MODKEY|WLR_MODIFIER_SHIFT, XKB_KEY_R,          togglerotation, {0} },
+ 	TAGKEYS(          XKB_KEY_1, XKB_KEY_exclam,                     0),
+ 	TAGKEYS(          XKB_KEY_2, XKB_KEY_at,                         1),
+ 	TAGKEYS(          XKB_KEY_3, XKB_KEY_numbersign,                 2),
+diff --git a/dwl.c b/dwl.c
+index a80de0542..6734ab28d 100644
+--- a/dwl.c
++++ b/dwl.c
+@@ -3,6 +3,7 @@
+  */
+ #include <getopt.h>
+ #include <libinput.h>
++#include <libudev.h>
+ #include <limits.h>
+ #include <linux/input-event-codes.h>
+ #include <signal.h>
+@@ -212,6 +213,7 @@ static void arrange(Monitor *m);
+ static void arrangelayer(Monitor *m, struct wl_list *list,
+ 		struct wlr_box *usable_area, int exclusive);
+ static void arrangelayers(Monitor *m);
++static int autorotation(void *path);
+ static void axisnotify(struct wl_listener *listener, void *data);
+ static void buttonpress(struct wl_listener *listener, void *data);
+ static void chvt(const Arg *arg);
+@@ -272,8 +274,10 @@ static void setlayout(const Arg *arg);
+ static void setmfact(const Arg *arg);
+ static void setmon(Client *c, Monitor *m, unsigned int newtags);
+ static void setpsel(struct wl_listener *listener, void *data);
++static void setrotation(const Arg *arg);
+ static void setsel(struct wl_listener *listener, void *data);
+ static void setup(void);
++static void setuprotation(void);
+ static void sigchld(int unused);
+ static void spawn(const Arg *arg);
+ static void startdrag(struct wl_listener *listener, void *data);
+@@ -282,6 +286,7 @@ static void tagmon(const Arg *arg);
+ static void tile(Monitor *m);
+ static void togglefloating(const Arg *arg);
+ static void togglefullscreen(const Arg *arg);
++static void togglerotation(const Arg *arg);
+ static void toggletag(const Arg *arg);
+ static void toggleview(const Arg *arg);
+ static void unmaplayersurfacenotify(struct wl_listener *listener, void *data);
+@@ -334,6 +339,10 @@ static struct wlr_box sgeom;
+ static struct wl_list mons;
+ static Monitor *selmon;
+ 
++static struct udev *udev;
++static struct udev_device *rotation_dev;
++static struct wl_event_source *rotation_loop;
++
+ /* global event handlers */
+ static struct wl_listener cursor_axis = {.notify = axisnotify};
+ static struct wl_listener cursor_button = {.notify = buttonpress};
+@@ -2680,6 +2689,167 @@ xwaylandready(struct wl_listener *listener, void *data)
+ }
+ #endif
+ 
++void
++setrotation(const Arg *arg)
++{
++	wlr_output_set_transform(selmon->wlr_output, arg->i);
++	wlr_output_commit(selmon->wlr_output);
++	printf("Set rotation %d\n", arg->i);
++}
++
++void
++togglerotation(const Arg *arg)
++{
++	rotation_enabled = !rotation_enabled;
++
++	/* Restart auto rotation loop */
++	if (rotation_enabled)
++		wl_event_source_timer_update(rotation_loop, rotation_delay);
++}
++
++static int
++autorotation(void *path)
++{
++	char path_x[1024], path_y[1024], path_z[1024];
++	FILE *fp_x, *fp_y, *fp_z;
++	int a_x, a_y, a_z;
++	float norm, n_x, n_y;
++	Arg arg;
++
++	if (!rotation_enabled)
++		return 0;
++
++	sprintf(path_x, "%s/%s", (char *)path, accel_x);
++	sprintf(path_y, "%s/%s", (char *)path, accel_y);
++	sprintf(path_z, "%s/%s", (char *)path, accel_z);
++
++	fp_x = fopen(path_x, "r");
++	fp_y = fopen(path_y, "r");
++	fp_z = fopen(path_z, "r");
++
++	if (fp_x == NULL || fp_y == NULL || fp_z == NULL) {
++		fprintf(stderr, "Failed to open accelerometer files.\n");
++		rotation_enabled = false;
++
++		fclose(fp_x);
++		fclose(fp_y);
++		fclose(fp_z);
++		return 1;
++	}
++
++	if (fscanf(fp_x, "%d", &a_x) != 1 ||
++			fscanf(fp_y, "%d", &a_y) != 1 ||
++			fscanf(fp_z, "%d", &a_z) != 1) {
++		fprintf(stderr, "Failed to read accelerometer values.\n");
++		rotation_enabled = false;
++
++		fclose(fp_x);
++		fclose(fp_y);
++		fclose(fp_z);
++		return 1;
++	}
++
++	fclose(fp_x);
++	fclose(fp_y);
++	fclose(fp_z);
++
++	norm = a_x * a_x + a_y * a_y;
++	if (norm != 0 && a_z * a_z / (norm + a_z * a_z) < rotation_flat) {
++		n_x = abs(a_x) * a_x / norm;
++		n_y = abs(a_y) * a_y / norm;
++
++		switch (selmon->wlr_output->transform) {
++		case WL_OUTPUT_TRANSFORM_NORMAL:
++			if (n_x > rotation_thresh) {
++				arg.i = WL_OUTPUT_TRANSFORM_90;
++				setrotation(&arg);
++			} else if (n_x < -rotation_thresh) {
++				arg.i = WL_OUTPUT_TRANSFORM_270;
++				setrotation(&arg);
++			} else if (n_y > 0) {
++				arg.i = WL_OUTPUT_TRANSFORM_180;
++				setrotation(&arg);
++			}
++			break;
++		case WL_OUTPUT_TRANSFORM_90:
++			if (n_y < -rotation_thresh) {
++				arg.i = WL_OUTPUT_TRANSFORM_NORMAL;
++				setrotation(&arg);
++			} else if (n_y > rotation_thresh) {
++				arg.i = WL_OUTPUT_TRANSFORM_180;
++				setrotation(&arg);
++			} else if (n_x < 0) {
++				arg.i = WL_OUTPUT_TRANSFORM_270;
++				setrotation(&arg);
++			}
++			break;
++		case WL_OUTPUT_TRANSFORM_180:
++			if (n_x > rotation_thresh) {
++				arg.i = WL_OUTPUT_TRANSFORM_90;
++				setrotation(&arg);
++			} else if (n_x < -rotation_thresh) {
++				arg.i = WL_OUTPUT_TRANSFORM_270;
++				setrotation(&arg);
++			} else if (n_y < 0) {
++				arg.i = WL_OUTPUT_TRANSFORM_NORMAL;
++				setrotation(&arg);
++			}
++			break;
++		case WL_OUTPUT_TRANSFORM_270:
++			if (n_y < -rotation_thresh) {
++				arg.i = WL_OUTPUT_TRANSFORM_NORMAL;
++				setrotation(&arg);
++			} else if (n_y > rotation_thresh) {
++				arg.i = WL_OUTPUT_TRANSFORM_180;
++				setrotation(&arg);
++			} else if (n_x > 0) {
++				arg.i = WL_OUTPUT_TRANSFORM_90;
++				setrotation(&arg);
++			}
++			break;
++		default:
++			break;
++		}
++	}
++
++	wl_event_source_timer_update(rotation_loop, rotation_delay);
++	return 0;
++}
++
++void
++setuprotation(void)
++{
++	struct stat statbuf;
++	char type = ' ';
++	const char *syspath;
++	struct wl_event_loop *ev = wl_display_get_event_loop(dpy);
++
++	udev = udev_new();
++	if (!udev)
++		die("Cannot create udev context");
++
++	if (stat(accel_path, &statbuf) < 0)
++		die("Failed to get properties of device file");
++
++	if (S_ISBLK(statbuf.st_mode))
++		type = 'b';
++	else if (S_ISCHR(statbuf.st_mode))
++		type = 'c';
++	else
++		die("Unknown device file type");
++
++	rotation_dev = udev_device_new_from_devnum(udev, type, statbuf.st_rdev);
++	if (!rotation_dev)
++		die("Failed to get sysfs device from path");
++
++	/* Setup event loop for auto rotation */
++	syspath = udev_device_get_syspath(rotation_dev);
++	rotation_loop = wl_event_loop_add_timer(ev, autorotation, (void *)syspath);
++
++	/* Start auto rotation loop */
++	wl_event_source_timer_update(rotation_loop, rotation_delay);
++}
++
+ int
+ main(int argc, char *argv[])
+ {
+@@ -2701,7 +2871,10 @@ main(int argc, char *argv[])
+ 	if (!getenv("XDG_RUNTIME_DIR"))
+ 		die("XDG_RUNTIME_DIR must be set");
+ 	setup();
++	setuprotation();
+ 	run(startup_cmd);
++	udev_device_unref(rotation_dev);
++	udev_unref(udev);
+ 	cleanup();
+ 	return EXIT_SUCCESS;
+ 
+
+From 79564b74255c9415ba573c070b0990a80467d5c3 Mon Sep 17 00:00:00 2001
+From: Unprex <bbrouant@sfr.fr>
+Date: Tue, 25 Oct 2022 21:43:21 +0200
+Subject: [PATCH 2/2] Remove debuging info
+
+---
+ dwl.c | 1 -
+ 1 file changed, 1 deletion(-)
+
+diff --git a/dwl.c b/dwl.c
+index 6734ab28d..c4127d45f 100644
+--- a/dwl.c
++++ b/dwl.c
+@@ -2694,7 +2694,6 @@ setrotation(const Arg *arg)
+ {
+ 	wlr_output_set_transform(selmon->wlr_output, arg->i);
+ 	wlr_output_commit(selmon->wlr_output);
+-	printf("Set rotation %d\n", arg->i);
+ }
+ 
+ void
