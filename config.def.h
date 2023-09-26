@@ -8,6 +8,18 @@ static const float focuscolor[]            = {1.0, 0.0, 0.0, 1.0};
 /* To conform the xdg-protocol, set the alpha to zero to restore the old behavior */
 static const float fullscreen_bg[]         = {0.1, 0.1, 0.1, 1.0};
 
+/* auto rotation */
+static bool rotation_enabled = true;
+static const int rotation_delay = 500;
+static const float rotation_flat = 0.9;
+static const float rotation_thresh = 0.6;
+
+/* accelerometer used */
+static const char *accel_path = "/dev/input/accel";
+static const char *accel_x = "in_accel_x_raw";
+static const char *accel_y = "in_accel_y_raw";
+static const char *accel_z = "in_accel_z_raw";
+
 /* tagging - tagcount must be no greater than 31 */
 #define TAGCOUNT (9)
 static const int tagcount = TAGCOUNT;
@@ -144,6 +156,11 @@ static const Key keys[] = {
 	{ MODKEY,                    XKB_KEY_period,     focusmon,       {.i = WLR_DIRECTION_RIGHT} },
 	{ MODKEY|WLR_MODIFIER_SHIFT, XKB_KEY_less,       tagmon,         {.i = WLR_DIRECTION_LEFT} },
 	{ MODKEY|WLR_MODIFIER_SHIFT, XKB_KEY_greater,    tagmon,         {.i = WLR_DIRECTION_RIGHT} },
+	{ MODKEY|WLR_MODIFIER_SHIFT, XKB_KEY_Up,         setrotation,    {.i = WL_OUTPUT_TRANSFORM_NORMAL} },
+	{ MODKEY|WLR_MODIFIER_SHIFT, XKB_KEY_Left,       setrotation,    {.i = WL_OUTPUT_TRANSFORM_90} },
+	{ MODKEY|WLR_MODIFIER_SHIFT, XKB_KEY_Down,       setrotation,    {.i = WL_OUTPUT_TRANSFORM_180} },
+	{ MODKEY|WLR_MODIFIER_SHIFT, XKB_KEY_Right,      setrotation,    {.i = WL_OUTPUT_TRANSFORM_270} },
+	{ MODKEY|WLR_MODIFIER_SHIFT, XKB_KEY_R,          togglerotation, {0} },
 	TAGKEYS(          XKB_KEY_1, XKB_KEY_exclam,                     0),
 	TAGKEYS(          XKB_KEY_2, XKB_KEY_at,                         1),
 	TAGKEYS(          XKB_KEY_3, XKB_KEY_numbersign,                 2),

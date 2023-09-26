@@ -3,11 +3,13 @@
  */
 #include <getopt.h>
 #include <libinput.h>
+#include <libudev.h>
 #include <limits.h>
 #include <linux/input-event-codes.h>
 #include <signal.h>
 #include <stdio.h>
 #include <stdlib.h>
+#include <sys/stat.h>
 #include <sys/wait.h>
 #include <time.h>
 #include <unistd.h>
@@ -228,6 +230,7 @@ static void arrange(Monitor *m);
 static void arrangelayer(Monitor *m, struct wl_list *list,
 		struct wlr_box *usable_area, int exclusive);
 static void arrangelayers(Monitor *m);
+static int autorotation(void *path);
 static void autostartexec(void);
 static void axisnotify(struct wl_listener *listener, void *data);
 static void buttonpress(struct wl_listener *listener, void *data);
@@ -298,8 +301,10 @@ static void setlayout(const Arg *arg);
 static void setmfact(const Arg *arg);
 static void setmon(Client *c, Monitor *m, uint32_t newtags);
 static void setpsel(struct wl_listener *listener, void *data);
+static void setrotation(const Arg *arg);
 static void setsel(struct wl_listener *listener, void *data);
 static void setup(void);
+static void setuprotation(void);
 static void spawn(const Arg *arg);
 static void startdrag(struct wl_listener *listener, void *data);
 static void tag(const Arg *arg);
@@ -307,6 +312,7 @@ static void tagmon(const Arg *arg);
 static void tile(Monitor *m);
 static void togglefloating(const Arg *arg);
 static void togglefullscreen(const Arg *arg);
+static void togglerotation(const Arg *arg);
 static void toggletag(const Arg *arg);
 static void toggleview(const Arg *arg);
 static void touchdown(struct wl_listener *listener, void *data);
@@ -371,6 +377,10 @@ static struct wlr_output_layout *output_layout;
 static struct wlr_box sgeom;
 static struct wl_list mons;
 static Monitor *selmon;
+
+static struct udev *udev;
+static struct udev_device *rotation_dev;
+static struct wl_event_source *rotation_loop;
 
 /* global event handlers */
 static struct wl_listener cursor_axis = {.notify = axisnotify};
@@ -2940,6 +2950,166 @@ xwaylandready(struct wl_listener *listener, void *data)
 }
 #endif
 
+void
+setrotation(const Arg *arg)
+{
+	wlr_output_set_transform(selmon->wlr_output, arg->i);
+	wlr_output_commit(selmon->wlr_output);
+}
+
+void
+togglerotation(const Arg *arg)
+{
+	rotation_enabled = !rotation_enabled;
+
+	/* Restart auto rotation loop */
+	if (rotation_enabled)
+		wl_event_source_timer_update(rotation_loop, rotation_delay);
+}
+
+static int
+autorotation(void *path)
+{
+	char path_x[1024], path_y[1024], path_z[1024];
+	FILE *fp_x, *fp_y, *fp_z;
+	int a_x, a_y, a_z;
+	float norm, n_x, n_y;
+	Arg arg;
+
+	if (!rotation_enabled)
+		return 0;
+
+	sprintf(path_x, "%s/%s", (char *)path, accel_x);
+	sprintf(path_y, "%s/%s", (char *)path, accel_y);
+	sprintf(path_z, "%s/%s", (char *)path, accel_z);
+
+	fp_x = fopen(path_x, "r");
+	fp_y = fopen(path_y, "r");
+	fp_z = fopen(path_z, "r");
+
+	if (fp_x == NULL || fp_y == NULL || fp_z == NULL) {
+		fprintf(stderr, "Failed to open accelerometer files.\n");
+		rotation_enabled = false;
+
+		fclose(fp_x);
+		fclose(fp_y);
+		fclose(fp_z);
+		return 1;
+	}
+
+	if (fscanf(fp_x, "%d", &a_x) != 1 ||
+			fscanf(fp_y, "%d", &a_y) != 1 ||
+			fscanf(fp_z, "%d", &a_z) != 1) {
+		fprintf(stderr, "Failed to read accelerometer values.\n");
+		rotation_enabled = false;
+
+		fclose(fp_x);
+		fclose(fp_y);
+		fclose(fp_z);
+		return 1;
+	}
+
+	fclose(fp_x);
+	fclose(fp_y);
+	fclose(fp_z);
+
+	norm = a_x * a_x + a_y * a_y;
+	if (norm != 0 && a_z * a_z / (norm + a_z * a_z) < rotation_flat) {
+		n_x = abs(a_x) * a_x / norm;
+		n_y = abs(a_y) * a_y / norm;
+
+		switch (selmon->wlr_output->transform) {
+		case WL_OUTPUT_TRANSFORM_NORMAL:
+			if (n_x > rotation_thresh) {
+				arg.i = WL_OUTPUT_TRANSFORM_90;
+				setrotation(&arg);
+			} else if (n_x < -rotation_thresh) {
+				arg.i = WL_OUTPUT_TRANSFORM_270;
+				setrotation(&arg);
+			} else if (n_y > 0) {
+				arg.i = WL_OUTPUT_TRANSFORM_180;
+				setrotation(&arg);
+			}
+			break;
+		case WL_OUTPUT_TRANSFORM_90:
+			if (n_y < -rotation_thresh) {
+				arg.i = WL_OUTPUT_TRANSFORM_NORMAL;
+				setrotation(&arg);
+			} else if (n_y > rotation_thresh) {
+				arg.i = WL_OUTPUT_TRANSFORM_180;
+				setrotation(&arg);
+			} else if (n_x < 0) {
+				arg.i = WL_OUTPUT_TRANSFORM_270;
+				setrotation(&arg);
+			}
+			break;
+		case WL_OUTPUT_TRANSFORM_180:
+			if (n_x > rotation_thresh) {
+				arg.i = WL_OUTPUT_TRANSFORM_90;
+				setrotation(&arg);
+			} else if (n_x < -rotation_thresh) {
+				arg.i = WL_OUTPUT_TRANSFORM_270;
+				setrotation(&arg);
+			} else if (n_y < 0) {
+				arg.i = WL_OUTPUT_TRANSFORM_NORMAL;
+				setrotation(&arg);
+			}
+			break;
+		case WL_OUTPUT_TRANSFORM_270:
+			if (n_y < -rotation_thresh) {
+				arg.i = WL_OUTPUT_TRANSFORM_NORMAL;
+				setrotation(&arg);
+			} else if (n_y > rotation_thresh) {
+				arg.i = WL_OUTPUT_TRANSFORM_180;
+				setrotation(&arg);
+			} else if (n_x > 0) {
+				arg.i = WL_OUTPUT_TRANSFORM_90;
+				setrotation(&arg);
+			}
+			break;
+		default:
+			break;
+		}
+	}
+
+	wl_event_source_timer_update(rotation_loop, rotation_delay);
+	return 0;
+}
+
+void
+setuprotation(void)
+{
+	struct stat statbuf;
+	char type = ' ';
+	const char *syspath;
+	struct wl_event_loop *ev = wl_display_get_event_loop(dpy);
+
+	udev = udev_new();
+	if (!udev)
+		die("Cannot create udev context");
+
+	if (stat(accel_path, &statbuf) < 0)
+		die("Failed to get properties of device file");
+
+	if (S_ISBLK(statbuf.st_mode))
+		type = 'b';
+	else if (S_ISCHR(statbuf.st_mode))
+		type = 'c';
+	else
+		die("Unknown device file type");
+
+	rotation_dev = udev_device_new_from_devnum(udev, type, statbuf.st_rdev);
+	if (!rotation_dev)
+		die("Failed to get sysfs device from path");
+
+	/* Setup event loop for auto rotation */
+	syspath = udev_device_get_syspath(rotation_dev);
+	rotation_loop = wl_event_loop_add_timer(ev, autorotation, (void *)syspath);
+
+	/* Start auto rotation loop */
+	wl_event_source_timer_update(rotation_loop, rotation_delay);
+}
+
 int
 main(int argc, char *argv[])
 {
@@ -2961,7 +3131,10 @@ main(int argc, char *argv[])
 	if (!getenv("XDG_RUNTIME_DIR"))
 		die("XDG_RUNTIME_DIR must be set");
 	setup();
+	setuprotation();
 	run(startup_cmd);
+	udev_device_unref(rotation_dev);
+	udev_unref(udev);
 	cleanup();
 	return EXIT_SUCCESS;
 
