@@ -13,7 +13,8 @@ static const int tagcount = TAGCOUNT;
 
 /* Autostart */
 static const char *const autostart[] = {
-        "wbg", "/path/to/your/image", NULL,
+        "wbg", "/home/dave/Pictures/Wallpapers/wallpaper.png", NULL,
+	"waybar", NULL,
         NULL /* terminate */
 };
 
